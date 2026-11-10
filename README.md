@@ -1,25 +1,51 @@
 # 🌈 Portronics Hydra 10 RGB Software Control (SignalRGB Plugin)
 
-Finally! Software-level RGB control for the **Portronics Hydra 10 (POR-1607 / POR-2329)**. This project provides a custom plugin for **SignalRGB** to bypass the limited hardware presets and enable full desktop synchronization.
+Finally! Software-level RGB control for the **Portronics Hydra 10 (POR-1607 / POR-2329)**. This project provides custom plugins for **SignalRGB** to bypass the limited hardware presets and enable full desktop synchronization.
 
 ### 🔍 Hardware Compatibility
+
+**Wired USB**
 * **Device:** Portronics Hydra 10 (Mechanical Keyboard)
 * **Vendor ID (VID):** `0x258A`
 * **Product ID (PID):** `0x010C`
 * **Controller:** SinoWealth Generic 68-Key HID
 * **Status:** Verified Working (Wired Mode)
 
+**2.4 GHz dongle**
+* **Receiver:** Compx Hydra 10
+* **Vendor ID (VID):** `0x3554`
+* **Product ID (PID):** `0xFA09`
+* **Lighting channel:** output report `0x13` on vendor interface 1
+* **Status:** Verified Working (2.4 GHz Mode)
+
 ### 🛠 Installation
-1. Download `zz_Portronics_Hydra10.js` from this repository.
-2. Put it in `%USERPROFILE%\Documents\WhirlwindFX\Plugins` (create the `Plugins` folder if it isn't there). Newer SignalRGB versions don't have the User Plugins button in Settings anymore, so just open the folder in Explorer.
-   Don't put it in `%LocalAppData%\VortxEngine\app-VERSION\...`. That folder gets replaced every time SignalRGB updates.
-3. Keep the file name as it is. See the note below for why.
+1. Download the plugin(s) you need from this repository:
+   * `zz_Portronics_Hydra10.js` — wired USB
+   * `zz_Portronics_Hydra10_Dongle.js` — 2.4 GHz receiver
+2. Put them in `%USERPROFILE%\Documents\WhirlwindFX\Plugins` (create the `Plugins` folder if it isn't there). Newer SignalRGB versions don't have the User Plugins button in Settings anymore, so just open the folder in Explorer.
+   Don't put them in `%LocalAppData%\VortxEngine\app-VERSION\...`. That folder gets replaced every time SignalRGB updates.
+3. Keep the file names as they are. See the note below for why the wired plugin starts with `zz_`.
 4. Restart SignalRGB completely (right-click the tray icon, Exit, then open it again).
-5. Connect the keyboard with the USB cable. The plugin can't detect it over Bluetooth or the 2.4GHz dongle.
+5. Connect the keyboard with the USB cable, **or** plug in the 2.4 GHz receiver and switch the board to 2.4 GHz mode. You can install both plugins and use either transport without changing anything in SignalRGB.
 6. In Lighting > Layout, make sure the whole keyboard is inside the canvas. If part of it sits outside (for example X is negative), those keys stay stuck on one color. Setting X and Y to 0 fixes it.
 
-### ⚠️ Why the file is named zz_
-SignalRGB ships its own SinoWealth plugin (`Sinowealth_Keyboard_Controller.js`) that claims the same VID/PID. It doesn't know the Hydra 10 (the keyboard reports model 133), so when that plugin gets picked the keyboard shows up as "Sinowealth Device" and the device console says:
+### 📡 2.4 GHz dongle
+The receiver enumerates as a **separate USB device** and does not speak the wired 519-byte feature protocol, so it gets its own plugin file. It is picked up automatically by VID/PID; there is nothing extra to configure.
+
+The wireless link is throughput-limited, so the plugin adapts the frame rate:
+
+| Content | Chunks per frame | Wireless rate |
+| --- | --- | --- |
+| Uniform colour (solid, breathing, spectrum) | 6 | ~10 fps |
+| Multi-colour canvas / rainbow | 7–10 | ~6–9 fps |
+| Full 96-slot keyframe | 8–10 | once per second |
+
+A full keyframe covering all 96 LED slots is sent every second. The 68 mapped keys get their canvas colours; the 28 slots with no key are held black. That last part is important: if those slots are omitted, the keyboard's own firmware effect keeps running on them and flashes through the desktop colours.
+
+Wired USB remains the smoother option (~30 fps). Use the cable for fast whole-board animation; static colours and sparse effects work well over radio.
+
+### ⚠️ Why the wired file is named zz_
+SignalRGB ships its own SinoWealth plugin (`Sinowealth_Keyboard_Controller.js`) that claims the same VID/PID (`258A:010C`). It doesn't know the Hydra 10 (the keyboard reports model 133), so when that plugin gets picked the keyboard shows up as "Sinowealth Device" and the device console says:
 
 ```
 Unknown Device ID: [133]. Reach out to support@signalrgb.com, or visit our Discord to get it added.
@@ -29,19 +55,35 @@ Unknown protocol for 133
 
 SignalRGB only keeps one plugin per VID/PID. From my logs it looks like it goes through plugins in alphabetical order and the last one wins, so a file called `Portronics_Hydra10_SinoWealth.js` gets replaced by the built-in one. The `zz_` prefix makes this plugin sort after `Sinowealth`. Installing the repo as a SignalRGB add-on didn't work for me either. I worked this out on SignalRGB 2.5.74 and it isn't documented anywhere, so an update could change it.
 
+The receiver has a different VID/PID (`3554:FA09`), so there is no built-in plugin to fight with. Its file keeps the `zz_` prefix only for consistency.
+
 To check which plugin got picked, open the newest log in `%LocalAppData%\WhirlwindFX\SignalRgb\Logs`. You should see:
 
 ```
 HID plugin with id 0x258A:0x010C already exists. Overwriting with new path: C:/Users/<you>/Documents/WhirlwindFX/Plugins/zz_Portronics_Hydra10.js
 ```
 
-and the keyboard should show up in SignalRGB as "Portronics Hydra 10".
+and the keyboard should show up in SignalRGB as "Portronics Hydra 10" (wired) or "Portronics Hydra 10 (2.4 GHz)" (receiver).
+
+### 🔬 2.4 GHz protocol (verified on hardware)
+The receiver carries lighting on **output report `0x13`** (19 data bytes) of its vendor interface. Each frame is chunked:
+
+```
+[0x88][totalChunks][chunkIndex][0x10 + len][14 payload bytes][checksum]
+```
+
+The checksum is `(0x13 + sum(bytes 0..18)) & 0xff`. The payload is a sequence of groups, `[R, G, B, count, ledIndex...]`, using the same LED indices as the wired board (`1..95`, 68 mapped keys).
+
+Only the live-lighting command `0x88` is ever sent. The config command `0x04` writes non-volatile storage and is deliberately not implemented.
+
+Chunks are spaced 13 ms apart and budgeted at 60 chunks/second, below the measured clean ceiling of about 64.
 
 ### 💡 Features
 * **Software Control:** Change colors via your PC instead of clunky `Fn` keys.
 * **Canvas Mode:** Sync your keyboard with your screen, music, or other RGB peripherals.
 * **Forced Mode:** Set a solid custom color that isn't available in the factory presets.
 * **Game Integration:** Works with SignalRGB’s game-sync features (e.g., flashing red on low health).
+* **Wireless Support:** Drive the keyboard through the 2.4 GHz dongle, no cable required.
 
 ### 🤝 Contributing
-If you find a bug or manage to get the 2.4GHz wireless dongle working with this protocol, feel free to open a Pull Request!
+If you find a bug, open an issue or a Pull Request with your SignalRGB version, the transport you used, and the relevant log lines from `%LocalAppData%\WhirlwindFX\SignalRgb\Logs`.

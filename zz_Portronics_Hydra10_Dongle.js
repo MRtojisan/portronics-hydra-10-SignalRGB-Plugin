@@ -16,11 +16,12 @@ export function Publisher() { return "WhirlwindFx"; }
 export function Size() { return [1, 5]; }
 export function DeviceType() { return "keyboard"; }
 
-// The receiver exposes two interfaces: 0 is the boot keyboard, 1 is the
-// vendor page (0xFF02) that advertises output report 0x13. Accept the vendor
-// interface either by number or by usage page, never the keyboard interface.
+// The receiver exposes two interfaces: 0 is the boot keyboard, 1 carries
+// several collections. Only the 0xFF02 collection (usage 0x02) has the
+// 19-byte output report 0x13; interface 1 also contains a 0xFF04 feature
+// report, so matching the interface alone can select the wrong endpoint.
 export function Validate(endpoint) {
-	return endpoint.interface === 1 || endpoint.usage_page >= 0xff00;
+	return endpoint.usage_page === 0xff02;
 }
 
 export function ControllableParameters() {
@@ -32,16 +33,16 @@ export function ControllableParameters() {
 }
 
 export function Initialize() {
-	SINOWEALTH.Initialize();
+	HYDRA10_DONGLE.Initialize();
 }
 
 export function Render() {
-	SINOWEALTH.sendColors();
+	HYDRA10_DONGLE.sendColors();
 }
 
 export function Shutdown(SystemSuspending) {
 	const color = SystemSuspending ? "#000000" : shutdownColor;
-	SINOWEALTH.sendColors(color);
+	HYDRA10_DONGLE.sendColors(color);
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +63,7 @@ const DONGLE_CMD_LIGHTING = 0x88;
 const DONGLE_CHUNKS_PER_SEC = 60; // below the measured clean ceiling of ~64
 const DONGLE_CHUNK_GAP_MS = 13; // vendor-measured minimum, start-to-start
 const DONGLE_KEYFRAME_MS = 1000;
-const LED_COUNT = 96;
+const DONGLE_LED_COUNT = 96;
 
 const DONGLE_PALETTES = [
 	{exact: true},
@@ -75,7 +76,7 @@ const DONGLE_PALETTES = [
 	{h: 1, s: 1, v: 1},
 ];
 
-function rgbToHsv(r, g, b) {
+function dongleRgbToHsv(r, g, b) {
 	r /= 255; g /= 255; b /= 255;
 	const max = Math.max(r, g, b);
 	const min = Math.min(r, g, b);
@@ -91,7 +92,7 @@ function rgbToHsv(r, g, b) {
 	return [h, max === 0 ? 0 : d / max, max];
 }
 
-function hsvToRgb(h, s, v) {
+function dongleHsvToRgb(h, s, v) {
 	h = ((h % 360) + 360) % 360;
 	const c = v * s;
 	const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
@@ -106,22 +107,22 @@ function hsvToRgb(h, s, v) {
 	return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
 }
 
-function quantizeHsv(rgb, hSteps, sSteps, vSteps) {
-	const [h, s, v] = rgbToHsv(rgb[0], rgb[1], rgb[2]);
+function dongleQuantizeHsv(rgb, hSteps, sSteps, vSteps) {
+	const [h, s, v] = dongleRgbToHsv(rgb[0], rgb[1], rgb[2]);
 	if (v < 0.04) return [0, 0, 0];
 	const hq = hSteps <= 1 ? 0 : (Math.round((h / 360) * hSteps) % hSteps);
 	const sq = sSteps <= 1 ? s : Math.round(s * (sSteps - 1)) / (sSteps - 1);
 	// Floor non-black colours to one value step so dim effects don't vanish.
 	const vq = vSteps <= 1 ? v : Math.max(1 / (vSteps - 1), Math.round(v * (vSteps - 1)) / (vSteps - 1));
-	return hsvToRgb((hq / hSteps) * 360, sq, vq);
+	return dongleHsvToRgb((hq / hSteps) * 360, sq, vq);
 }
 
-function buildDongleGroups(perLed, palette, indices) {
+function dongleBuildGroups(perLed, palette, indices) {
 	const buckets = new Map();
 	for (const i of indices) {
 		let c = perLed[i] || [0, 0, 0];
 		c = [c[0] | 0, c[1] | 0, c[2] | 0];
-		if (!palette.exact) c = quantizeHsv(c, palette.h, palette.s, palette.v);
+		if (!palette.exact) c = dongleQuantizeHsv(c, palette.h, palette.s, palette.v);
 		const k = `${c[0]},${c[1]},${c[2]}`;
 		if (!buckets.has(k)) buckets.set(k, {color: c, indices: []});
 		buckets.get(k).indices.push(i);
@@ -129,7 +130,7 @@ function buildDongleGroups(perLed, palette, indices) {
 	return Array.from(buckets.values());
 }
 
-function encodeDongleGroups(groups) {
+function dongleEncodeGroups(groups) {
 	const out = [];
 	for (const g of groups) {
 		out.push(g.color[0], g.color[1], g.color[2], g.indices.length);
@@ -138,7 +139,7 @@ function encodeDongleGroups(groups) {
 	return out;
 }
 
-function chunkDonglePayload(payload) {
+function dongleChunkPayload(payload) {
 	if (!payload.length) return [];
 	const total = Math.ceil(payload.length / DONGLE_CHUNK);
 	if (total > 255) return [];
@@ -160,7 +161,7 @@ function chunkDonglePayload(payload) {
 	return chunks;
 }
 
-function averageDongleGroups(perLed, indices) {
+function dongleAverageGroups(perLed, indices) {
 	let r = 0, g = 0, b = 0;
 	for (const i of indices) {
 		const c = perLed[i] || [0, 0, 0];
@@ -175,15 +176,15 @@ function averageDongleGroups(perLed, indices) {
 // Pick the richest palette that still fits one frame's chunk budget.
 // `indices` lets animation frames carry only the 68 mapped keys, while the
 // periodic keyframe covers all 96 slots so the unmapped ones stay black.
-function buildDongleChunks(perLed, indices) {
+function dongleBuildChunks(perLed, indices) {
 	for (const palette of DONGLE_PALETTES) {
-		const chunks = chunkDonglePayload(encodeDongleGroups(buildDongleGroups(perLed, palette, indices)));
+		const chunks = dongleChunkPayload(dongleEncodeGroups(dongleBuildGroups(perLed, palette, indices)));
 		if (chunks.length && chunks.length <= DONGLE_MAX_CHUNKS) return chunks;
 	}
-	return chunkDonglePayload(encodeDongleGroups(averageDongleGroups(perLed, indices)));
+	return dongleChunkPayload(dongleEncodeGroups(dongleAverageGroups(perLed, indices)));
 }
 
-function hashChunks(chunks) {
+function dongleHashChunks(chunks) {
 	let h = 2166136261 >>> 0;
 	for (const c of chunks) {
 		for (let i = 0; i < c.length; i++) {
@@ -194,7 +195,7 @@ function hashChunks(chunks) {
 	return h >>> 0;
 }
 
-export class SINOWEALTH_Device_Protocol {
+export class Hydra10_Dongle_Protocol {
 	constructor() {
 		this.Config = {
 			ModelID: 133,
@@ -207,6 +208,7 @@ export class SINOWEALTH_Device_Protocol {
 		this.lastKeyHash = null;
 		this.lastFullAt = 0;
 		this.lastFrameAt = 0;
+		this.loggedChunks = 0;
 	}
 
 	getLedPositions() { return this.Config.LedPositions; }
@@ -215,7 +217,7 @@ export class SINOWEALTH_Device_Protocol {
 	getModelID() { return this.Config.ModelID; }
 
 	Initialize() {
-		const layoutData = SINOWEALTHdeviceLibrary.LEDLayout["68-Key"];
+		const layoutData = HYDRA10_DONGLE_LIBRARY.LEDLayout["68-Key"];
 
 		this.Config.LedNames = layoutData.vLedNames;
 		this.Config.LedPositions = layoutData.vLedPositions;
@@ -234,8 +236,8 @@ export class SINOWEALTH_Device_Protocol {
 		// All 96 matrix slots are painted every keyframe, exactly like the wired
 		// path. The 28 slots with no key stay black; leaving them out lets the
 		// keyboard's own firmware effect flash through.
-		const perLed = new Array(LED_COUNT);
-		for (let i = 0; i < LED_COUNT; i++) perLed[i] = [0, 0, 0];
+		const perLed = new Array(DONGLE_LED_COUNT);
+		for (let i = 0; i < DONGLE_LED_COUNT; i++) perLed[i] = [0, 0, 0];
 
 		for (let iIdx = 0; iIdx < deviceLeds.length; iIdx++) {
 			const iPxX = deviceLedPositions[iIdx][0];
@@ -243,9 +245,9 @@ export class SINOWEALTH_Device_Protocol {
 			let color;
 
 			if (overrideColor) {
-				color = hexToRgb(overrideColor);
+				color = dongleHexToRgb(overrideColor);
 			} else if (LightingMode === "Forced") {
-				color = hexToRgb(forcedColor);
+				color = dongleHexToRgb(forcedColor);
 			} else {
 				color = device.color(iPxX, iPxY);
 			}
@@ -259,17 +261,17 @@ export class SINOWEALTH_Device_Protocol {
 	writeRGBPackage(perLed, force) {
 		const now = Date.now();
 
-		const keyChunks = buildDongleChunks(perLed, this.Config.Leds);
+		const keyChunks = dongleBuildChunks(perLed, this.Config.Leds);
 		if (!keyChunks.length) return;
 
-		const keyHash = hashChunks(keyChunks);
+		const keyHash = dongleHashChunks(keyChunks);
 		const keyframeDue = force || !this.lastFullAt || (now - this.lastFullAt >= DONGLE_KEYFRAME_MS);
 
 		// Skip unchanged animation frames between keyframes.
 		if (!force && !keyframeDue && keyHash === this.lastKeyHash) return;
 
 		const useFull = keyframeDue;
-		const chunks = useFull ? buildDongleChunks(perLed, ALL_LED_INDICES) : keyChunks;
+		const chunks = useFull ? dongleBuildChunks(perLed, DONGLE_ALL_LED_INDICES) : keyChunks;
 		if (!chunks.length) return;
 
 		// Budget by chunks per second, not frames. A 6-chunk frame may start
@@ -298,10 +300,15 @@ export class SINOWEALTH_Device_Protocol {
 		this.lastKeyHash = keyHash;
 		if (useFull) this.lastFullAt = Date.now();
 		this.lastFrameAt = Date.now();
+
+		if (this.loggedChunks !== chunks.length) {
+			device.log(`2.4GHz frame sent: ${chunks.length} chunks (${useFull ? "full 96-slot keyframe" : "68 key LEDs"})`);
+			this.loggedChunks = chunks.length;
+		}
 	}
 }
 
-export class deviceLibrary {
+export class Hydra10_Dongle_Library {
 	constructor() {
 		this.LEDLayout = {
 			"68-Key": {
@@ -332,11 +339,11 @@ export class deviceLibrary {
 	}
 }
 
-const ALL_LED_INDICES = Array.from({length: LED_COUNT}, (_, i) => i);
-const SINOWEALTHdeviceLibrary = new deviceLibrary();
-const SINOWEALTH = new SINOWEALTH_Device_Protocol();
+const DONGLE_ALL_LED_INDICES = Array.from({length: DONGLE_LED_COUNT}, (_, i) => i);
+const HYDRA10_DONGLE_LIBRARY = new Hydra10_Dongle_Library();
+const HYDRA10_DONGLE = new Hydra10_Dongle_Protocol();
 
-function hexToRgb(hex) {
+function dongleHexToRgb(hex) {
 	const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
 	return result ? [parseInt(result[1], 16), parseInt(result[2], 16), parseInt(result[3], 16)] : [0, 0, 0];
 }

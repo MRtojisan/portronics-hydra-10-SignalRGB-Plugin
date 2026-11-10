@@ -44,6 +44,20 @@ A full keyframe covering all 96 LED slots is sent every second. The 68 mapped ke
 
 Wired USB remains the smoother option (~30 fps). Use the cable for fast whole-board animation; static colours and sparse effects work well over radio.
 
+#### If the wireless plugin shows no lighting
+1. Make sure the receiver's plugin was actually picked. The device should appear as **Portronics Hydra 10 (2.4 GHz)**, not as a generic HID device or a keyboard.
+2. Open the newest log in `%LocalAppData%\WhirlwindFX\SignalRgb\Logs` and look for:
+   ```
+   HID plugin with id 0x3554:0xFA09 already exists. Overwriting with new path: ...\zz_Portronics_Hydra10_Dongle.js
+   Hydra 10 2.4GHz initialized (output report 0x13, cmd 0x88)
+   2.4GHz frame sent: 8 chunks (full 96-slot keyframe)
+   ```
+   A `2.4GHz write failed: ...` line means the endpoint was opened but the write was rejected.
+3. If the plugin line is missing, SignalRGB did not load the file. Check that it is in the `Plugins` folder with the `.js` extension and restart SignalRGB from the tray icon, not just close the window.
+4. Make sure only one file claims `3554:FA09`. Like the wired plugin, the `zz_` prefix wins over anything that sorts earlier.
+5. Confirm the keyboard is awake and its switch is on **2.4 GHz**, and that the receiver is in a working USB port. Re-seat the receiver if needed.
+6. The plugin only writes the verified live-lighting channel (output report `0x13`, command `0x88`). It never sends the config command `0x04`, so a failed experiment cannot leave the keyboard in a bad state.
+
 ### ⚠️ Why the wired file is named zz_
 SignalRGB ships its own SinoWealth plugin (`Sinowealth_Keyboard_Controller.js`) that claims the same VID/PID (`258A:010C`). It doesn't know the Hydra 10 (the keyboard reports model 133), so when that plugin gets picked the keyboard shows up as "Sinowealth Device" and the device console says:
 

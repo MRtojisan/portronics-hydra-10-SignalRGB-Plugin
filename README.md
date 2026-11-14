@@ -41,9 +41,9 @@ The plugin exposes a **Frame size** slider (device page → Portronics Hydra 10 
 | Frame size | Colours per frame | Full-board rate | Avg colour error |
 | --- | --- | --- | --- |
 | 6 | 4 | ~9–10 fps | 35/255 (blocky) |
-| **7 (default)** | 7 | ~8 fps | 19/255 |
-| 8 | 11 | ~7 fps | 10/255 |
-| 10 | 18 | ~6 fps | under 2/255 |
+| **7 (default)** | 7 | ~8 fps | 20/255 |
+| 8 | 11 | ~7 fps | 13/255 |
+| 10 | 18 | ~6 fps | 8/255 |
 
 A 2D rainbow is the worst case. Waves, gradients and solid colours look much better at the same setting (about 5/255 at size 7) because they contain fewer distinct colours. Frames with few enough colours are sent losslessly, so a solid colour is never approximated.
 

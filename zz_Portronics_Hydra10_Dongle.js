@@ -29,6 +29,7 @@ export function ControllableParameters() {
 		{property: "shutdownColor", group: "lighting", label: "Shutdown Color", type: "color", default: "#000000"},
 		{property: "LightingMode", group: "lighting", label: "Lighting Mode", type: "combobox", values: ["Canvas", "Forced"], default: "Canvas"},
 		{property: "forcedColor", group: "lighting", label: "Forced Color", type: "color", default: "#009bde"},
+		{property: "frameChunks", group: "lighting", label: "Frame size (6 = smoothest, 10 = most accurate colors)", type: "number", min: "6", max: "10", step: "1", default: "7"},
 	];
 }
 
@@ -64,6 +65,24 @@ const DONGLE_CHUNKS_PER_SEC = 60; // below the measured clean ceiling of ~64
 const DONGLE_CHUNK_GAP_MS = 13; // vendor-measured minimum, start-to-start
 const DONGLE_KEYFRAME_MS = 1000;
 const DONGLE_LED_COUNT = 96;
+
+// Smoothness tuning ----------------------------------------------------------
+// Delta mode sends only the LEDs whose colour changed, biggest change first,
+// capped at DONGLE_DELTA_CHUNKS chunks per frame. Short frames mean a much
+// higher frame rate. It relies on the keyboard holding the colour of LEDs that
+// are left out of a frame. On the Hydra 10 dongle this is NOT the case (keys
+// flash back to the firmware effect), so it stays false.
+const DONGLE_DELTA_MODE = false;
+
+// Smooth mode: every frame is a full frame, but its colours are clustered down
+// to as few groups as the chunk budget allows. A full frame must name all 68
+// keys (68 bytes) plus 4 bytes per colour, so:
+//   6 chunks = 4 colours (10 fps)   7 chunks = 7 colours (8.5 fps)
+//   8 chunks = 11 colours (7.5 fps) 10 chunks = 18 colours (6 fps)
+// The "Frame size" slider picks the chunk budget.
+const DONGLE_SMOOTH_MODE = true;
+const DONGLE_DELTA_CHUNKS = 4;   // ~15 fps worst case at 60 chunks/s
+const DONGLE_QUANT_STEP = 8;     // RGB rounding step in delta mode (bigger = fewer updates)
 
 const DONGLE_PALETTES = [
 	{exact: true},
@@ -184,6 +203,135 @@ function dongleBuildChunks(perLed, indices) {
 	return dongleChunkPayload(dongleEncodeGroups(dongleAverageGroups(perLed, indices)));
 }
 
+// Keyframe: pick the palette from the 68 mapped keys only (so colours do not
+// shift when a keyframe goes out), then apply it to all 96 slots.
+function dongleBuildFull(perLed, keyIndices, allIndices) {
+	let groups = null;
+	for (const palette of DONGLE_PALETTES) {
+		const probe = dongleChunkPayload(dongleEncodeGroups(dongleBuildGroups(perLed, palette, keyIndices)));
+		if (probe.length && probe.length <= DONGLE_MAX_CHUNKS) {
+			groups = dongleBuildGroups(perLed, palette, allIndices);
+			break;
+		}
+	}
+	if (!groups) groups = dongleAverageGroups(perLed, allIndices);
+	return {chunks: dongleChunkPayload(dongleEncodeGroups(groups)), groups};
+}
+
+function dongleQuantizeRgb(c, step) {
+	const q = (v) => Math.min(255, Math.round(v / step) * step);
+	return [q(c[0] | 0), q(c[1] | 0), q(c[2] | 0)];
+}
+
+function dongleColorDist(a, b) {
+	const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+	return 2 * dr * dr + 4 * dg * dg + 3 * db * db; // eye is most sensitive to green
+}
+
+function dongleMeanColor(list) {
+	let r = 0, g = 0, b = 0;
+	for (const p of list) { r += p[0]; g += p[1]; b += p[2]; }
+	const n = list.length || 1;
+	return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+}
+
+// Median cut: repeatedly split the box with the most colour spread.
+function dongleMedianCut(pts, k) {
+	const boxes = [pts.slice()];
+	while (boxes.length < k) {
+		let bi = -1, bScore = 0, bCh = 0;
+		for (let i = 0; i < boxes.length; i++) {
+			const box = boxes[i];
+			if (box.length < 2) continue;
+			for (let ch = 0; ch < 3; ch++) {
+				let lo = 255, hi = 0;
+				for (const p of box) { if (p[ch] < lo) lo = p[ch]; if (p[ch] > hi) hi = p[ch]; }
+				const score = (hi - lo) * box.length * (ch === 1 ? 2 : 1);
+				if (score > bScore) { bScore = score; bi = i; bCh = ch; }
+			}
+		}
+		if (bi < 0) break;
+		const box = boxes[bi];
+		box.sort((x, y) => x[bCh] - y[bCh]);
+		const mid = box.length >> 1;
+		boxes.splice(bi, 1, box.slice(0, mid), box.slice(mid));
+	}
+	return boxes.map(dongleMeanColor);
+}
+
+// Cluster the LEDs' colours into at most k groups. Seeding k-means with last
+// frame's centres keeps the groups stable, so colours do not shimmer.
+function dongleCluster(perLed, indices, k, seeds) {
+	const pts = indices.map((i) => {
+		const c = perLed[i] || [0, 0, 0];
+		return [c[0] | 0, c[1] | 0, c[2] | 0];
+	});
+
+	const distinct = new Map();
+	for (let n = 0; n < pts.length; n++) {
+		const key = pts[n][0] + "," + pts[n][1] + "," + pts[n][2];
+		if (!distinct.has(key)) distinct.set(key, {color: pts[n], indices: []});
+		distinct.get(key).indices.push(indices[n]);
+	}
+	if (distinct.size <= k) return {groups: Array.from(distinct.values()), centers: null}; // lossless
+
+	let centers = (seeds && seeds.length === k) ? seeds.map((c) => c.slice()) : dongleMedianCut(pts, k);
+	const assign = new Array(pts.length).fill(0);
+	for (let iter = 0; iter < 4; iter++) {
+		for (let n = 0; n < pts.length; n++) {
+			let best = 0, bestD = Infinity;
+			for (let c = 0; c < centers.length; c++) {
+				const d = dongleColorDist(pts[n], centers[c]);
+				if (d < bestD) { bestD = d; best = c; }
+			}
+			assign[n] = best;
+		}
+		if (iter === 3) break;
+		const members = centers.map(() => []);
+		for (let n = 0; n < pts.length; n++) members[assign[n]].push(pts[n]);
+		centers = centers.map((c, i) => (members[i].length ? dongleMeanColor(members[i]) : c));
+	}
+
+	const out = centers.map((c) => ({color: c, indices: []}));
+	for (let n = 0; n < pts.length; n++) out[assign[n]].indices.push(indices[n]);
+	return {groups: out.filter((g) => g.indices.length), centers};
+}
+
+// Delta frame: LEDs whose colour differs from what the keyboard shows,
+// largest error first, packed until the chunk budget is full. Colours that
+// do not fit this frame stay "unsent" and are picked up by a later frame.
+function dongleBuildDelta(perLed, shown, indices, maxChunks) {
+	const changed = [];
+	for (const i of indices) {
+		const t = dongleQuantizeRgb(perLed[i] || [0, 0, 0], DONGLE_QUANT_STEP);
+		const s = shown[i];
+		let err = 768;
+		if (s) {
+			err = Math.abs(t[0] - s[0]) + Math.abs(t[1] - s[1]) + Math.abs(t[2] - s[2]);
+			if (!err) continue;
+		}
+		changed.push({i, c: t, err});
+	}
+	if (!changed.length) return {chunks: [], sent: []};
+	changed.sort((a, b) => b.err - a.err);
+
+	const budget = maxChunks * DONGLE_CHUNK;
+	const buckets = new Map();
+	const sent = [];
+	let used = 0;
+	for (const e of changed) {
+		const k = e.c[0] + "," + e.c[1] + "," + e.c[2];
+		const g = buckets.get(k);
+		const cost = g ? 1 : 5; // joining a colour group costs 1 byte, a new group 5
+		if (used + cost > budget) continue;
+		used += cost;
+		if (g) g.indices.push(e.i);
+		else buckets.set(k, {color: e.c, indices: [e.i]});
+		sent.push(e);
+	}
+	return {chunks: dongleChunkPayload(dongleEncodeGroups(Array.from(buckets.values()))), sent};
+}
+
 function dongleHashChunks(chunks) {
 	let h = 2166136261 >>> 0;
 	for (const c of chunks) {
@@ -205,10 +353,36 @@ export class Hydra10_Dongle_Protocol {
 			Leds: [],
 			layout: "68-Key"
 		};
+		this.resetState();
+	}
+
+	resetState() {
 		this.lastKeyHash = null;
 		this.lastFullAt = 0;
-		this.lastFrameAt = 0;
+		this.nextFrameAt = 0;
 		this.loggedChunks = 0;
+		this.shown = new Array(DONGLE_LED_COUNT).fill(null); // colour each LED is known to show
+		this.centers = null; // last frame's colour clusters (smooth mode)
+	}
+
+	// One smooth frame: cluster the 68 keys into as many colours as the chunk
+	// budget allows. On a keyframe the 28 unmapped slots ride along as black.
+	buildSmooth(perLed, withUnmapped) {
+		const want = (typeof frameChunks === "undefined") ? 7 : Math.round(Number(frameChunks)) || 7;
+		const chunks = Math.max(6, Math.min(DONGLE_MAX_CHUNKS, want));
+		const keys = this.Config.Leds;
+		const k = Math.max(1, Math.floor((chunks * DONGLE_CHUNK - keys.length) / 4));
+
+		const res = dongleCluster(perLed, keys, k, this.centers);
+		this.centers = res.centers;
+		const groups = res.groups;
+
+		if (withUnmapped && this.unmapped.length) {
+			const black = groups.find((g) => g.color[0] === 0 && g.color[1] === 0 && g.color[2] === 0);
+			if (black) black.indices = black.indices.concat(this.unmapped);
+			else groups.push({color: [0, 0, 0], indices: this.unmapped.slice()});
+		}
+		return {chunks: dongleChunkPayload(dongleEncodeGroups(groups)), groups};
 	}
 
 	getLedPositions() { return this.Config.LedPositions; }
@@ -223,6 +397,9 @@ export class Hydra10_Dongle_Protocol {
 		this.Config.LedPositions = layoutData.vLedPositions;
 		this.Config.Leds = layoutData.vLeds;
 
+		this.resetState();
+		const mapped = new Set(layoutData.vLeds);
+		this.unmapped = DONGLE_ALL_LED_INDICES.filter((i) => !mapped.has(i));
 		device.log("Hydra 10 2.4GHz initialized (output report 0x13, cmd 0x88)");
 		device.setName(this.Config.DeviceName);
 		device.setSize(layoutData.size);
@@ -230,12 +407,18 @@ export class Hydra10_Dongle_Protocol {
 	}
 
 	sendColors(overrideColor) {
+		const force = !!overrideColor;
+
+		// Pace first: building a frame costs 68 canvas reads, so skip all of it
+		// while the radio is still busy. The next frame is then built from the
+		// freshest canvas instead of a stale one.
+		if (!force && Date.now() < this.nextFrameAt) return;
+
 		const deviceLedPositions = this.getLedPositions();
 		const deviceLeds = this.getLeds();
 
-		// All 96 matrix slots are painted every keyframe, exactly like the wired
-		// path. The 28 slots with no key stay black; leaving them out lets the
-		// keyboard's own firmware effect flash through.
+		// Unmapped slots stay black; leaving them out lets the keyboard's own
+		// firmware effect flash through.
 		const perLed = new Array(DONGLE_LED_COUNT);
 		for (let i = 0; i < DONGLE_LED_COUNT; i++) perLed[i] = [0, 0, 0];
 
@@ -255,31 +438,38 @@ export class Hydra10_Dongle_Protocol {
 			perLed[deviceLeds[iIdx]] = color;
 		}
 
-		this.writeRGBPackage(perLed, !!overrideColor);
+		this.writeRGBPackage(perLed, force);
 	}
 
 	writeRGBPackage(perLed, force) {
-		const now = Date.now();
+		const start = Date.now();
+		const keyframeDue = force || !this.lastFullAt || (start - this.lastFullAt >= DONGLE_KEYFRAME_MS);
 
-		const keyChunks = dongleBuildChunks(perLed, this.Config.Leds);
-		if (!keyChunks.length) return;
+		let chunks;
+		let groups = null;   // keyframe: what was sent per colour group
+		let sentLeds = null; // delta frame: what was sent per LED
+		let keyHash = null;
 
-		const keyHash = dongleHashChunks(keyChunks);
-		const keyframeDue = force || !this.lastFullAt || (now - this.lastFullAt >= DONGLE_KEYFRAME_MS);
-
-		// Skip unchanged animation frames between keyframes.
-		if (!force && !keyframeDue && keyHash === this.lastKeyHash) return;
-
-		const useFull = keyframeDue;
-		const chunks = useFull ? dongleBuildChunks(perLed, DONGLE_ALL_LED_INDICES) : keyChunks;
+		if (keyframeDue) {
+			const full = DONGLE_SMOOTH_MODE
+				? this.buildSmooth(perLed, true)
+				: dongleBuildFull(perLed, this.Config.Leds, DONGLE_ALL_LED_INDICES);
+			chunks = full.chunks;
+			groups = full.groups;
+		} else if (DONGLE_SMOOTH_MODE) {
+			chunks = this.buildSmooth(perLed, false).chunks;
+			keyHash = dongleHashChunks(chunks);
+			if (keyHash === this.lastKeyHash) return; // unchanged frame
+		} else if (DONGLE_DELTA_MODE) {
+			const delta = dongleBuildDelta(perLed, this.shown, this.Config.Leds, DONGLE_DELTA_CHUNKS);
+			chunks = delta.chunks;
+			sentLeds = delta.sent;
+		} else {
+			chunks = dongleBuildChunks(perLed, this.Config.Leds);
+			keyHash = dongleHashChunks(chunks);
+			if (keyHash === this.lastKeyHash) return; // unchanged frame
+		}
 		if (!chunks.length) return;
-
-		// Budget by chunks per second, not frames. A 6-chunk frame may start
-		// every ~100 ms; an 8-chunk frame every ~133 ms.
-		const budgetMs = chunks.length * (1000 / DONGLE_CHUNKS_PER_SEC);
-		if (!force && now - this.lastFrameAt < budgetMs) return;
-
-		this.lastFrameAt = now;
 
 		for (let i = 0; i < chunks.length; i++) {
 			const chunkStart = Date.now();
@@ -288,6 +478,7 @@ export class Hydra10_Dongle_Protocol {
 				device.write(packet, packet.length);
 			} catch (e) {
 				device.log("2.4GHz write failed: " + e);
+				this.nextFrameAt = Date.now() + 100; // back off instead of hammering a failing endpoint
 				return;
 			}
 			// Space write starts 13 ms apart, matching the vendor minimum.
@@ -297,12 +488,20 @@ export class Hydra10_Dongle_Protocol {
 			}
 		}
 
-		this.lastKeyHash = keyHash;
-		if (useFull) this.lastFullAt = Date.now();
-		this.lastFrameAt = Date.now();
+		// Budget is measured from the START of the frame, not the end. Writing
+		// already takes ~13 ms per chunk, so counting from the end would charge
+		// the radio twice for the same time.
+		this.nextFrameAt = start + chunks.length * (1000 / DONGLE_CHUNKS_PER_SEC);
+
+		if (groups) {
+			for (const g of groups) for (const i of g.indices) this.shown[i] = g.color;
+			this.lastFullAt = Date.now();
+		}
+		if (sentLeds) for (const e of sentLeds) this.shown[e.i] = e.c;
+		if (keyHash !== null) this.lastKeyHash = keyHash;
 
 		if (this.loggedChunks !== chunks.length) {
-			device.log(`2.4GHz frame sent: ${chunks.length} chunks (${useFull ? "full 96-slot keyframe" : "68 key LEDs"})`);
+			device.log(`2.4GHz frame sent: ${chunks.length} chunks (${keyframeDue ? "full 96-slot keyframe" : DONGLE_SMOOTH_MODE ? "smooth" : DONGLE_DELTA_MODE ? "delta" : "68 key LEDs"})`);
 			this.loggedChunks = chunks.length;
 		}
 	}
